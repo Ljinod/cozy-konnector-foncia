@@ -19,50 +19,48 @@ const request = requestFactory({
   jar: true
 })
 
-const baseUrl = 'http://books.toscrape.com'
-
 module.exports = new BaseKonnector(start)
 
-// The start function is run by the BaseKonnector instance only when it got all the account
-// information (fields). When you run this connector yourself in "standalone" mode or "dev" mode,
-// the account information come from ./konnector-dev-config.json file
+const vendor = 'foncia'
+const baseUrl = 'https://fr.foncia.com'
+
 async function start(fields) {
   log('info', 'Authenticating ...')
   await authenticate(fields.login, fields.password)
   log('info', 'Successfully logged in')
-  // The BaseKonnector instance expects a Promise as return of the function
-  log('info', 'Fetching the list of documents')
-  const $ = await request(`${baseUrl}/index.html`)
-  // cheerio (https://cheerio.js.org/) uses the same api as jQuery (http://jquery.com/)
-  log('info', 'Parsing list of documents')
-  const documents = await parseDocuments($)
 
-  // here we use the saveBills function even if what we fetch are not bills, but this is the most
-  // common case in connectors
+  log('info', 'Fetching list of properties')
+  const propertiesIds = await getPropertiesIDs()
+  log('info', 'Fetching bills')
+  const bills = await fetchBills(propertiesIds)
   log('info', 'Saving data to Cozy')
-  await saveBills(documents, fields.folderPath, {
-    // this is a bank identifier which will be used to link bills to bank operations. These
-    // identifiers should be at least a word found in the title of a bank operation related to this
-    // bill. It is not case sensitive.
-    identifiers: ['books']
+  await saveBills(bills, fields.folderPath, {
+    identifiers: [vendor]
   })
 }
 
-// this shows authentication using the [signin function](https://github.com/konnectors/libs/blob/master/packages/cozy-konnector-libs/docs/api.md#module_signin)
-// even if this in another domain here, but it works as an example
-function authenticate(username, password) {
+async function authenticate(username, password) {
+  const url = `${baseUrl}/login`
+
+  // We need to extract a CSRF token
+  const $ = await request(url)
+  const _csrf_token = $("input[name='_csrf_token']").attr('value')
+
   return signin({
-    url: `http://quotes.toscrape.com/login`,
-    formSelector: 'form',
-    formData: { username, password },
-    // the validate function will check if
+    url: `${baseUrl}/login`,
+    formSelector: '.Form',
+    formData: {
+      _username: username,
+      _password: password,
+      _csrf_token
+    },
     validate: (statusCode, $) => {
-      // The login in toscrape.com always works excepted when no password is set
       if ($(`a[href='/logout']`).length === 1) {
         return true
       } else {
-        // cozy-konnector-libs has its own logging function which format these logs with colors in
-        // standalone and dev mode and as JSON in production mode
+        // cozy-konnector-libs has its own logging function which format these
+        // logs with colors in standalone and dev mode and as JSON in production
+        // mode
         log('error', $('.error').text())
         return false
       }
@@ -70,53 +68,114 @@ function authenticate(username, password) {
   })
 }
 
-// The goal of this function is to parse a html page wrapped by a cheerio instance
-// and return an array of js objects which will be saved to the cozy by saveBills (https://github.com/konnectors/libs/blob/master/packages/cozy-konnector-libs/docs/api.md#savebills)
-function parseDocuments($) {
-  // you can find documentation about the scrape function here :
-  // https://github.com/konnectors/libs/blob/master/packages/cozy-konnector-libs/docs/api.md#scrape
-  const docs = scrape(
+// Get the IDs of the different properties one could own/rent.
+async function getPropertiesIDs() {
+  const $ = await request(`${baseUrl}/espace-client/espace-de-gestion/mon-bien`)
+
+  return $('.MyPropertiesSelector-slides li')
+    .map(function(i, el) {
+      return $(el).attr('data-property')
+    })
+    .get()
+}
+
+// Retrieve the "bills" for a given property.
+async function getBillsForProperty(propertyId) {
+  const page = await request(
+    `${baseUrl}/espace-client/espace-de-gestion/mon-bien/${propertyId}`
+  )
+
+  const propertyDesc = page(`span[class="MyPropertiesSelector-item-desc"]`)
+    .first()
+    .text()
+
+  // "Go" to the page where all the documents are accessible.
+  const documentsUrl = page(`a[class='Icon--book']`).attr('href')
+  const $ = await request(`${baseUrl}${documentsUrl}`)
+
+  const bills = scrape(
     $,
     {
-      title: {
-        sel: 'h3 a',
-        attr: 'title'
+      description: {
+        sel: '.TeaserRow-desc'
       },
-      amount: {
-        sel: '.price_color',
-        parse: normalizePrice
+      // The format of the date is: DD.MM.YYYY
+      date: {
+        sel: '.TeaserRow-date',
+        parse: function(text) {
+          if (text !== '') {
+            return normalizeDate(text)
+          } else {
+            return text
+          }
+        }
       },
-      fileurl: {
-        sel: 'img',
-        attr: 'src',
-        parse: src => `${baseUrl}/${src}`
-      },
-      filename: {
-        sel: 'h3 a',
-        attr: 'title',
-        parse: title => `${title}.jpg`
+      billPath: {
+        sel: '.Download',
+        attr: 'href'
       }
     },
-    'article'
+    '.TeaserRow'
   )
-  return docs.map(doc => ({
-    ...doc,
-    // the saveBills function needs a date field
-    // even if it is a little artificial here (these are not real bills)
-    date: new Date(),
+
+  return bills.map(bill => ({
+    ...bill,
+    propertyDesc
+  }))
+}
+
+async function fetchBills(propertiesIds) {
+  const bills = []
+  for (let propertyId in propertiesIds) {
+    if (propertyId !== '') {
+      bills.push.apply(bills, await getBillsForProperty(propertyId))
+    }
+  }
+
+  return bills.map(bill => ({
+    ...bill,
     currency: '€',
-    vendor: 'template',
-    metadata: {
-      // it can be interesting that we add the date of import. This is not mandatory but may be
-      // usefull for debugging or data migration
+    fileurl: `${baseUrl}${bill.billPath}`,
+    vendor,
+    filename: `${formatFilename(bill)}.pdf`,
+    metadate: {
       importDate: new Date(),
-      // document version, usefull for migration after change of document structure
       version: 1
     }
   }))
 }
 
-// convert a price string to a float
-function normalizePrice(price) {
-  return parseFloat(price.replace('£', '').trim())
+// Return a string representation of the date that follows this format:
+// "YYYY-MM-DD". Leading "0" for the day and the month are added if needed.
+function formatDate(date) {
+  let month = date.getMonth() + 1
+  if (month < 10) {
+    month = '0' + month
+  }
+
+  let day = date.getDate()
+  if (day < 10) {
+    day = '0' + day
+  }
+
+  let year = date.getFullYear()
+
+  return `${year}${month}${day}`
+}
+
+// Return a JS Date object from the string representation. The format of the String has
+// to be "DD.MM.YYYY".
+function normalizeDate(date) {
+  let [day, month, year] = date.split('.')
+  return new Date(`${year}-${month}-${day}`)
+}
+
+// Return an appropriate filename given a "bill": some do not have a date
+// associated with it.
+function formatFilename(bill) {
+  if (bill.date === '') {
+    return `${bill.propertyDesc}-${bill.description}`
+  } else {
+    return `${bill.propertyDesc}-${formatDate(bill.date)}-${bill.description}`
+  }
 }
